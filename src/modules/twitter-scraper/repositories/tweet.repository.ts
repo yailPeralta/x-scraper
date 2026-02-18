@@ -7,7 +7,7 @@ import { Tweet, TweetDocument } from '../schemas/tweet.schema';
 export class TweetRepository {
   constructor(
     @InjectModel(Tweet.name) private tweetModel: Model<TweetDocument>,
-  ) {}
+  ) { }
 
   async create(tweetData: Partial<Tweet>): Promise<Tweet> {
     const tweet = new this.tweetModel(tweetData);
@@ -24,7 +24,7 @@ export class TweetRepository {
   ): Promise<Tweet[]> {
     return this.tweetModel
       .find({ 'author.username': username })
-      .sort({ createdAt: -1 })
+      .sort({ tweetCreatedAt: -1 })
       .skip(options.skip || 0)
       .limit(options.limit || 20)
       .exec();
@@ -35,20 +35,25 @@ export class TweetRepository {
   ): Promise<Tweet[]> {
     return this.tweetModel
       .find()
-      .sort({ createdAt: -1 })
+      .sort({ tweetCreatedAt: -1 })
       .skip(options.skip || 0)
       .limit(options.limit || 20)
       .exec();
   }
 
   async bulkUpsert(tweets: Partial<Tweet>[]): Promise<number> {
-    const operations = tweets.map((tweet) => ({
-      updateOne: {
-        filter: { tweetId: tweet.tweetId },
-        update: { $set: tweet },
-        upsert: true,
-      },
-    }));
+    const operations = tweets.map((tweet) => {
+      // Exclude timestamp fields managed by Mongoose (`timestamps: true`).
+      // Including them in $set causes a MongoBulkWriteError path conflict.
+      const { tweetCreatedAt, updatedAt, ...tweetData } = tweet as any;
+      return {
+        updateOne: {
+          filter: { tweetId: tweet.tweetId },
+          update: { $set: tweetData },
+          upsert: true,
+        },
+      };
+    });
 
     const result = await this.tweetModel.bulkWrite(operations);
     return result.upsertedCount + result.modifiedCount;

@@ -63,7 +63,7 @@ export class Tweet {
   author: TweetAuthor;
 
   @Prop({ required: true, index: true })
-  createdAt: Date;
+  tweetCreatedAt: Date;
 
   @Prop({ default: Date.now })
   scrapedAt: Date;
@@ -115,6 +115,6 @@ export class Tweet {
 export const TweetSchema = SchemaFactory.createForClass(Tweet);
 
 // Índices compuestos para búsquedas eficientes
-TweetSchema.index({ 'author.username': 1, createdAt: -1 });
-TweetSchema.index({ hashtags: 1, createdAt: -1 });
-TweetSchema.index({ tweetType: 1, createdAt: -1 });
+TweetSchema.index({ 'author.username': 1, tweetCreatedAt: -1 });
+TweetSchema.index({ hashtags: 1, tweetCreatedAt: -1 });
+TweetSchema.index({ tweetType: 1, tweetCreatedAt: -1 });

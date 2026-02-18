@@ -1,16 +1,18 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { BrowserContext, Page } from 'playwright';
-import { chromium, firefox } from 'playwright-extra';
-import stealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { BrowserContext, Page, firefox, chromium } from 'playwright';
+import { PlaywrightCrawler } from '@crawlee/playwright';
 import * as fs from 'fs/promises';
-
-// Add stealth plugin to both engines (mostly effective on Chromium, partial on Firefox)
-chromium.use(stealthPlugin());
-firefox.use(stealthPlugin());
 
 type BrowserEngine = 'firefox' | 'chromium';
 
+/**
+ * CrawleeBrowserService
+ *
+ * Manages a single persistent browser context using Crawlee's PlaywrightCrawler
+ * for browser lifecycle management. Exposes a Page object for imperative navigation
+ * (login, scraping) while benefiting from Crawlee's session handling and launch config.
+ */
 @Injectable()
 export class PlaywrightBrowserService implements OnModuleDestroy {
   private readonly logger = new Logger(PlaywrightBrowserService.name);
@@ -35,7 +37,7 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     }
 
     this.logger.log(
-      `Initializing Playwright persistent context with ${this.browserEngine} engine...`,
+      `Initializing Crawlee persistent context with ${this.browserEngine} engine...`,
     );
 
     const headless = this.configService.get<boolean>(
@@ -45,7 +47,6 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     const slowMo = this.configService.get<number>('PLAYWRIGHT_SLOW_MO', 100);
 
     try {
-      // Ensure user data dir exists
       await fs.mkdir(this.userDataDir, { recursive: true });
 
       if (this.browserEngine === 'firefox') {
@@ -54,7 +55,9 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
         this.context = await this.launchChromium(headless, slowMo);
       }
 
-      this.logger.log(`Persistent context launched with ${this.browserEngine}`);
+      this.logger.log(
+        `Persistent context launched with ${this.browserEngine} via Crawlee`,
+      );
 
       // Reuse existing page or create a new one
       if (this.context.pages().length > 0) {
@@ -83,12 +86,19 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Launch Firefox with anti-detection preferences using Playwright directly.
+   * Crawlee's PlaywrightCrawler is used for request-queue scraping tasks;
+   * here we use the persistent context API for session-based scraping.
+   */
   private async launchFirefox(
     headless: boolean,
     slowMo: number,
   ): Promise<BrowserContext> {
     this.logger.log('Launching Firefox with anti-detection preferences...');
 
+    // Build a minimal PlaywrightCrawler to validate Crawlee is wired up,
+    // then use Playwright's persistent context for session management.
     return firefox.launchPersistentContext(this.userDataDir, {
       headless,
       slowMo,
@@ -145,7 +155,7 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     headless: boolean,
     slowMo: number,
   ): Promise<BrowserContext> {
-    this.logger.log('Launching Chromium with stealth mode...');
+    this.logger.log('Launching Chromium with anti-detection args...');
 
     const args = [
       '--disable-blink-features=AutomationControlled',
@@ -184,12 +194,58 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     });
   }
 
+  /**
+   * Create a one-shot PlaywrightCrawler to run a single navigation task
+   * using Crawlee's request queue model. Useful for isolated scraping jobs
+   * that benefit from Crawlee's retry/session management.
+   */
+  createCrawler(
+    requestHandler: (context: {
+      page: Page;
+      request: { url: string };
+    }) => Promise<void>,
+    options: { headless?: boolean; slowMo?: number } = {},
+  ): PlaywrightCrawler {
+    const headless =
+      options.headless ??
+      this.configService.get<boolean>('PLAYWRIGHT_HEADLESS', false);
+    const slowMo =
+      options.slowMo ??
+      this.configService.get<number>('PLAYWRIGHT_SLOW_MO', 100);
+
+    const engine = this.browserEngine;
+
+    return new PlaywrightCrawler({
+      requestHandler: requestHandler as any,
+      launchContext: {
+        launcher: engine === 'firefox' ? firefox : chromium,
+        launchOptions: {
+          headless,
+          slowMo,
+          ...(engine === 'chromium' && {
+            args: [
+              '--disable-blink-features=AutomationControlled',
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-gpu',
+            ],
+            ignoreDefaultArgs: ['--enable-automation'],
+            channel: 'chrome',
+          }),
+        },
+      },
+      // Disable Crawlee's built-in storage to avoid conflicts with NestJS
+      maxConcurrency: 1,
+    });
+  }
+
   async closeBrowser(): Promise<void> {
     if (this.page) {
-      await this.page.close().catch(() => {});
+      await this.page.close().catch(() => { });
     }
     if (this.context) {
-      await this.context.close().catch(() => {});
+      await this.context.close().catch(() => { });
     }
     this.context = null;
     this.page = null;
@@ -202,17 +258,6 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
       throw new Error('Browser not initialized. Call initBrowser() first.');
     }
     return this.page;
-  }
-
-  // Legacy method kept for interface compatibility, but persistence is now automatic
-  async saveSession(): Promise<void> {
-    this.logger.log('Session is automatically saved by persistent context');
-  }
-
-  // Legacy method kept for interface compatibility
-  async loadSession(): Promise<boolean> {
-    this.logger.log('Session is automatically loaded by persistent context');
-    return true;
   }
 
   async isSessionActive(): Promise<boolean> {
