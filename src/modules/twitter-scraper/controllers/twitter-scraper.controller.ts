@@ -40,6 +40,7 @@ export class TwitterScraperController {
       limit: query.limit,
       includeReplies: query.includeReplies,
       includeRetweets: query.includeRetweets,
+      onlyReplies: query.onlyReplies
     });
 
     await this.tweetRepository.bulkUpsert(tweets);

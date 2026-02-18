@@ -113,7 +113,6 @@ Create a `.env` file in the root directory with the following variables:
 | `PLAYWRIGHT_HEADLESS` | No | `true` | Run browser in headless mode |
 | `PLAYWRIGHT_TIMEOUT` | No | `30000` | Navigation timeout (ms) |
 | `PLAYWRIGHT_SLOW_MO` | No | `100` | Slow down actions (ms) |
-| `PLAYWRIGHT_SESSION_PATH` | No | `./sessions/twitter-session.json` | Session storage path |
 | **Scraping** |
 | `SCRAPING_MAX_TWEETS_PER_REQUEST` | No | `100` | Max tweets per request |
 | `SCRAPING_SCROLL_DELAY` | No | `2000` | Delay between scrolls (ms) |
@@ -143,7 +142,6 @@ MONGODB_DB_NAME=twitter-scraper
 PLAYWRIGHT_HEADLESS=false
 PLAYWRIGHT_TIMEOUT=30000
 PLAYWRIGHT_SLOW_MO=100
-PLAYWRIGHT_SESSION_PATH=./sessions/twitter-session.json
 
 # Scraping Configuration
 SCRAPING_MAX_TWEETS_PER_REQUEST=100

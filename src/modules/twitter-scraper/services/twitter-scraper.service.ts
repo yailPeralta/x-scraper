@@ -13,7 +13,7 @@ export class TwitterScraperService implements OnModuleInit {
     private browserService: PlaywrightBrowserService,
     private tweetRepository: TweetRepository,
     private configService: ConfigService,
-  ) { }
+  ) {}
 
   async onModuleInit() {
     await this.browserService.initBrowser();
@@ -39,7 +39,9 @@ export class TwitterScraperService implements OnModuleInit {
       await page.goto('https://x.com/i/flow/login');
 
       // Esperar que el input username sea visible
-      const usernameLocator = page.locator(TWITTER_SELECTORS.LOGIN.USERNAME_INPUT);
+      const usernameLocator = page.locator(
+        TWITTER_SELECTORS.LOGIN.USERNAME_INPUT,
+      );
       await usernameLocator.waitFor();
 
       // Llenar el campo de username
@@ -47,7 +49,9 @@ export class TwitterScraperService implements OnModuleInit {
       page.click(TWITTER_SELECTORS.LOGIN.NEXT_BUTTON);
 
       // Esperar que el input password sea visible
-      const passwordLocator = page.locator(TWITTER_SELECTORS.LOGIN.PASSWORD_INPUT);
+      const passwordLocator = page.locator(
+        TWITTER_SELECTORS.LOGIN.PASSWORD_INPUT,
+      );
       await passwordLocator.waitFor();
 
       passwordLocator.fill(twitterPassword);
@@ -87,20 +91,23 @@ export class TwitterScraperService implements OnModuleInit {
       limit?: number;
       includeReplies?: boolean;
       includeRetweets?: boolean;
+      onlyReplies?: boolean;
     } = {},
   ): Promise<any[]> {
     await this.ensureAuthenticated();
+    console.log('options', options);
 
     const page = this.browserService.getPage();
     const limit = options.limit || 10;
     const includeReplies = options.includeReplies ?? false;
     const includeRetweets = options.includeRetweets ?? true;
+    const onlyReplies = options.onlyReplies ?? false;
 
     this.logger.log(`Scraping tweets from @${username}, limit: ${limit}`);
 
     try {
       // Navegar al perfil del usuario
-      const profileUrl = includeReplies
+      const profileUrl = onlyReplies
         ? `https://x.com/${username}/with_replies`
         : `https://x.com/${username}`;
 
@@ -118,18 +125,17 @@ export class TwitterScraperService implements OnModuleInit {
         // Obtener todos los artículos de tweets visibles
         const tweetElements = await page.$$(TWITTER_SELECTORS.TWEET.ARTICLE);
 
-        console.log('TWEET ELEMENTS LENGTH\n', tweetElements.length);
-        console.log('SCROLL ATTEMPTS\n', scrollAttempts);
-
         for (const element of tweetElements) {
-          console.log(element.innerHTML);
           if (tweets.length >= limit) break;
 
           try {
             const tweetData = await this.extractTweetData(element);
 
             // Filtrar retweets si no se desean
-            if (!includeRetweets && tweetData.tweetType === 'retweet') {
+            if (
+              (!includeRetweets && tweetData.tweetType === 'retweet') ||
+              (!includeReplies && tweetData.tweetType === 'replay')
+            ) {
               continue;
             }
 
@@ -250,9 +256,7 @@ export class TwitterScraperService implements OnModuleInit {
         scrollAttempts++;
       }
 
-      this.logger.log(
-        `Found ${tweets.length} tweets for search: "${query}"`,
-      );
+      this.logger.log(`Found ${tweets.length} tweets for search: "${query}"`);
       return tweets;
     } catch (error) {
       this.logger.error(`Error searching tweets for: "${query}"`, error);
@@ -291,7 +295,9 @@ export class TwitterScraperService implements OnModuleInit {
     }
 
     if (filters.fromAccounts && filters.fromAccounts.length > 0) {
-      const fromQuery = filters.fromAccounts.map((acc) => `from:${acc}`).join(' OR ');
+      const fromQuery = filters.fromAccounts
+        .map((acc) => `from:${acc}`)
+        .join(' OR ');
       query += ` (${fromQuery})`;
     }
 

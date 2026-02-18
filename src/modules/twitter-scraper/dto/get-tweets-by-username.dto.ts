@@ -18,4 +18,9 @@ export class GetTweetsByUsernameDto {
   @Type(() => Boolean)
   @IsBoolean()
   includeRetweets?: boolean = true;
+
+  @IsOptional()
+  @Type(() => Boolean)
+  @IsBoolean()
+  onlyReplies?: boolean = false;
 }

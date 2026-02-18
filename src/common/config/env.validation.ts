@@ -14,10 +14,11 @@ export interface EnvironmentVariables {
   MONGODB_PORT: number;
   MONGODB_DB_NAME: string;
   // Playwright
+  PLAYWRIGHT_BROWSER: 'firefox' | 'chromium';
   PLAYWRIGHT_HEADLESS: boolean;
   PLAYWRIGHT_TIMEOUT: number;
   PLAYWRIGHT_SLOW_MO: number;
-  PLAYWRIGHT_SESSION_PATH: string;
+
   // Scraping
   SCRAPING_MAX_TWEETS_PER_REQUEST: number;
   SCRAPING_SCROLL_DELAY: number;
@@ -44,12 +45,10 @@ export const validationSchema = Joi.object({
   MONGODB_DB_NAME: Joi.string().default('twitter-scraper'),
 
   // Playwright
+  PLAYWRIGHT_BROWSER: Joi.string().valid('firefox', 'chromium').default('firefox'),
   PLAYWRIGHT_HEADLESS: Joi.boolean().default(true),
   PLAYWRIGHT_TIMEOUT: Joi.number().default(30000),
   PLAYWRIGHT_SLOW_MO: Joi.number().default(100),
-  PLAYWRIGHT_SESSION_PATH: Joi.string().default(
-    './sessions/twitter-session.json',
-  ),
 
   // Scraping
   SCRAPING_MAX_TWEETS_PER_REQUEST: Joi.number().default(100),
