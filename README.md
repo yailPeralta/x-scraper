@@ -321,7 +321,6 @@ interface Tweet {
     verified: boolean;       // Verification status
   };
   createdAt: Date;           // Tweet creation date
-  scrapedAt: Date;           // Scraping timestamp
   metrics: {
     likes: number;
     retweets: number;

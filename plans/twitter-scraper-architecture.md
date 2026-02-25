@@ -95,7 +95,6 @@ src/
     verified: boolean
   }
   createdAt: Date
-  scrapedAt: Date
   metrics: {
     likes: number
     retweets: number

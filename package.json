@@ -17,15 +17,22 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "seed:trackers": "npx ts-node -r tsconfig-paths/register src/common/database/mongodb/seeds/tracker-config.seed.ts",
+    "seed:trending-topics": "npx ts-node -r tsconfig-paths/register src/common/database/mongodb/seeds/trending-topics.seed.ts"
   },
   "dependencies": {
+    "@crawlee/browser-pool": "^3.16.0",
     "@crawlee/playwright": "^3.16.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.3",
     "@nestjs/core": "^11.0.1",
+    "@nestjs/event-emitter": "^3.0.1",
     "@nestjs/mongoose": "^11.0.4",
     "@nestjs/platform-express": "^11.0.1",
+    "@nestjs/schedule": "^6.1.1",
+    "@xdevplatform/xdk": "^0.4.0",
+    "camoufox-js": "^0.1.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
     "crawlee": "^3.16.0",

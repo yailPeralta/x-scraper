@@ -71,9 +71,6 @@ export class Tweet {
   @Prop({ required: true, index: true })
   createdAt: Date;
 
-  @Prop({ default: Date.now })
-  scrapedAt: Date;
-
   @Prop({ type: TweetMetrics })
   metrics: TweetMetrics;
 
