@@ -1,22 +1,23 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Page } from 'playwright';
-import { PlaywrightBrowserService } from './playwright-browser.service';
 import { TwitterScraperService } from './twitter-scraper.service';
 import { TrendingTopicRepository } from '../repositories/trending-topic.repository';
 import { TweetRepository } from '../repositories/tweet.repository';
 import { XUserRepository } from '../repositories/x-user.repository';
 import { TWITTER_SELECTORS } from '../constants/twitter-selectors.constants';
 import { ScrapingThrottle } from '../utils/scraping-throttle.util';
-
-const GLOBAL_TRENDING_URL = 'https://x.com/i/jf/global-trending/home';
+import { BROWSER_ENGINE_SERVICE } from '../interfaces/browser-engine.interface';
+import type { IBrowserEngineService } from '../interfaces/browser-engine.interface';
+import { URLS } from '../constants/twitter-urls.constants';
 
 @Injectable()
 export class TrendingScraperService {
   private readonly logger = new Logger(TrendingScraperService.name);
 
   constructor(
-    private readonly browserService: PlaywrightBrowserService,
+    @Inject(BROWSER_ENGINE_SERVICE)
+    private readonly engineService: IBrowserEngineService,
     private readonly scraperService: TwitterScraperService,
     private readonly trendingTopicRepository: TrendingTopicRepository,
     private readonly tweetRepository: TweetRepository,
@@ -36,7 +37,7 @@ export class TrendingScraperService {
    *  6. Extract and persist tweets into the tweets collection with isTrending=true.
    */
   async getTrendingTweetsByTopic(tag: string, limit = 20): Promise<any[]> {
-    await this.scraperService.ensureAuthenticated();
+    //await this.scraperService.ensureAuthenticated();
 
     const topic = await this.trendingTopicRepository.findByTag(tag);
     if (!topic) {
@@ -49,55 +50,52 @@ export class TrendingScraperService {
       `Scraping trending tweets for topic: ${topic.tag} (${topic.nameEn} / ${topic.nameEs}), limit: ${limit}`,
     );
 
-    const page = this.browserService.getPage();
-
     try {
-      await page.goto(GLOBAL_TRENDING_URL, { waitUntil: 'domcontentloaded' });
+      const rawTweets = await this.engineService.navigate(
+        URLS.GLOBAL_TRENDING_URL,
+        async (page) => {
+          // Wait for topic buttons to appear
+          await page.waitForSelector(TWITTER_SELECTORS.TRENDING.TOPIC_BUTTON, {
+            timeout: 15000,
+          });
 
-      // Wait for topic buttons to appear
-      await page.waitForSelector(TWITTER_SELECTORS.TRENDING.TOPIC_BUTTON, {
-        timeout: 15000,
-      });
-
-      // Find the button whose label matches nameEn or nameEs (case-insensitive)
-      const clicked = await this.clickTopicButton(
-        page,
-        topic.nameEn,
-        topic.nameEs,
-      );
-
-      if (!clicked) {
-        await this.browserService.takeScreenshot(
-          `trending-topic-not-found-${tag}`,
-        );
-        throw new Error(
-          `Could not find topic button for "${topic.nameEn}" or "${topic.nameEs}" on the trending page.`,
-        );
-      }
-
-      this.logger.log(`Clicked topic button for "${topic.nameEn}"`);
-
-      // Wait for tweet articles to load after clicking the topic
-      await page
-        .waitForSelector(TWITTER_SELECTORS.TRENDING.TWEET_ARTICLE, {
-          timeout: 15000,
-        })
-        .catch(() => {
-          this.logger.warn(
-            `No tweet articles found after clicking topic "${topic.nameEn}". The page may be empty.`,
+          // Find the button whose label matches nameEn or nameEs (case-insensitive)
+          const clicked = await this.clickTopicButton(
+            page,
+            topic.nameEn,
+            topic.nameEs,
           );
-        });
 
-      const scrollDelay = this.configService.get<number>(
-        'SCRAPING_SCROLL_DELAY',
-        2000,
-      );
+          if (!clicked) {
+            await this.engineService.takeScreenshot(
+              `trending-topic-not-found-${tag}`,
+            );
+            throw new Error(
+              `Could not find topic button for "${topic.nameEn}" or "${topic.nameEs}" on the trending page.`,
+            );
+          }
 
-      // Extract tweets with scroll-and-collect loop
-      const rawTweets = await this.extractTrendingTweets(
-        page,
-        limit,
-        scrollDelay,
+          this.logger.log(`Clicked topic button for "${topic.nameEn}"`);
+
+          // Wait for tweet articles to load after clicking the topic
+          await page
+            .waitForSelector(TWITTER_SELECTORS.TRENDING.TWEET_ARTICLE, {
+              timeout: 15000,
+            })
+            .catch(() => {
+              this.logger.warn(
+                `No tweet articles found after clicking topic "${topic.nameEn}". The page may be empty.`,
+              );
+            });
+
+          const scrollDelay = this.configService.get<number>(
+            'SCRAPING_SCROLL_DELAY',
+            2000,
+          );
+
+          // Extract tweets with scroll-and-collect loop
+          return this.extractTrendingTweets(page, limit, scrollDelay);
+        },
       );
 
       this.logger.log(
@@ -152,7 +150,7 @@ export class TrendingScraperService {
         `Error scraping trending tweets for topic "${tag}": ${error?.message}`,
         error,
       );
-      await this.browserService.takeScreenshot(`trending-error-${tag}`);
+      await this.engineService.takeScreenshot(`trending-error-${tag}`);
       throw error;
     }
   }
@@ -224,7 +222,7 @@ export class TrendingScraperService {
 
     // One throttle instance per scraping session; burstThreshold = limit so
     // pauses only kick in when we exceed the requested limit (i.e. large runs).
-    const throttle = new ScrapingThrottle({ burstThreshold: limit });
+    const throttle = new ScrapingThrottle({ burstThreshold: 10 });
 
     this.logger.debug(`Starting scroll loop: limit=${limit}`);
 
@@ -257,7 +255,6 @@ export class TrendingScraperService {
             seenIds.add(rawTweetData.tweetId);
             collected.push(rawTweetData);
 
-            // Insert throttle delay after each new tweet when limit > 50
             await throttle.tick(collected.length);
           }
         } catch (err) {
@@ -354,7 +351,7 @@ export class TrendingScraperService {
       };
 
       // Tweet ID
-      const tweetLink = el.querySelector('a[href*="/status/"]');
+      const tweetLink = el.querySelector(selectors.TWEET.STATUS_LINK);
       const tweetId = tweetLink
         ? tweetLink.getAttribute('href')?.match(/status\/(\d+)/)?.[1] || ''
         : '';
@@ -447,7 +444,7 @@ export class TrendingScraperService {
         authorData: {
           username: authorUsername,
           displayName: authorDisplayName,
-          verified: !!el.querySelector('[data-testid="icon-verified"]'),
+          verified: !!el.querySelector(selectors.TWEET.VERIFIED_BADGE),
         },
         tweetCreatedAt: timestamp,
         metrics: { likes, retweets, replies, views, bookmarks: 0 },

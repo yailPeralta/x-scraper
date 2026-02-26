@@ -1,38 +1,29 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { BrowserContext, BrowserType, Page, firefox, chromium } from 'playwright';
-import { PlaywrightCrawler } from '@crawlee/playwright';
+import { BrowserContext, Page, firefox, chromium } from 'playwright';
 import type { PlaywrightLaunchContext } from '@crawlee/playwright';
-import { BrowserName, DeviceCategory, OperatingSystemsName } from '@crawlee/browser-pool';
-import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
-import type { FingerprintOptions } from '@crawlee/browser-pool';
-import { RequestQueue } from 'crawlee';
+import {
+  BrowserName,
+  DeviceCategory,
+  OperatingSystemsName,
+} from '@crawlee/browser-pool';
 import * as fs from 'fs/promises';
+import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
+import { readFileSync, existsSync } from 'fs';
+import Database from 'better-sqlite3';
 
 export type BrowserEngine = 'firefox' | 'chromium';
 
 export { BrowserName, DeviceCategory, OperatingSystemsName };
 
-export interface CrawlerOptions {
-  headless?: boolean;
-  slowMo?: number;
-  /** Enable Crawlee browser fingerprint spoofing (default: reads USE_FINGERPRINTS env, fallback true) */
-  useFingerprints?: boolean;
-  /** Crawlee FingerprintOptions for customising browser/OS/device fingerprints */
-  fingerprintOptions?: FingerprintOptions;
-  /** Proxy URL, e.g. http://user:pass@proxy.example.com:8080 (default: reads PROXY_URL env) */
-  proxyUrl?: string;
-  /** Use Camoufox stealth Firefox build — automatically disables fingerprints (default: reads USE_CAMOUFOX env, fallback false) */
-  useCamoufox?: boolean;
-  requestQueue?: RequestQueue;
-}
-
 /**
- * CrawleeBrowserService
+ * PlaywrightBrowserService
  *
- * Manages a single persistent browser context using Crawlee's PlaywrightCrawler
- * for browser lifecycle management. Exposes a Page object for imperative navigation
- * (login, scraping) while benefiting from Crawlee's session handling and launch config.
+ * Responsible solely for the lifecycle of the persistent Playwright browser
+ * context: initialisation, session management, screenshots and teardown.
+ *
+ * Crawlee-specific logic (crawler creation, fingerprints, proxy) has been
+ * moved to CrawleeService to keep this service focused on a single concern.
  */
 @Injectable()
 export class PlaywrightBrowserService implements OnModuleDestroy {
@@ -52,6 +43,135 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     this.userDataDir = `./sessions/browser-data-${this.browserEngine}`;
   }
 
+  private async createCamoufoxBrowserContextWithCookies(headless: boolean) {
+    const browser = await firefox.launch(
+      await camoufoxLaunchOptions({
+        headless,
+        humanizeInput: true,
+      }),
+    );
+
+    const context = await browser.newContext({
+      locale: 'es-AR',
+      timezoneId: 'America/Argentina/Cordoba',
+      viewport: { width: 1280, height: 800 },
+    });
+
+    const cookiesFile = this.configService.get<string>(
+      'X_COOKIES_FILE',
+      './sessions/x-cookies.json',
+    );
+
+    if (!existsSync(cookiesFile)) {
+      throw new Error(`Cookies file not found at ${cookiesFile}`);
+    }
+
+    const cookies = JSON.parse(readFileSync(cookiesFile, 'utf-8'));
+
+    // Normalizar cookies al formato que espera Playwright/Camoufox.
+    // Las cookies exportadas desde extensiones de navegador usan el formato
+    // de la API de extensiones (e.g. "no_restriction", "lax" en minúsculas,
+    // null), que Playwright no acepta. Se mapean a los valores válidos:
+    // "Strict" | "Lax" | "None".
+    const sameSiteMap: Record<string, 'Strict' | 'Lax' | 'None'> = {
+      strict: 'Strict',
+      Strict: 'Strict',
+      lax: 'Lax',
+      Lax: 'Lax',
+      none: 'None',
+      None: 'None',
+      no_restriction: 'None', // Chrome/Firefox extension API format
+    };
+
+    const normalizedCookies = cookies.map((cookie) => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain.startsWith('.')
+        ? cookie.domain
+        : `.${cookie.domain}`,
+      path: cookie.path || '/',
+      secure: cookie.secure ?? true,
+      httpOnly: cookie.httpOnly ?? false,
+      sameSite:
+        cookie.sameSite && sameSiteMap[cookie.sameSite]
+          ? sameSiteMap[cookie.sameSite]
+          : 'Lax',
+    }));
+
+    await context.addCookies(normalizedCookies);
+
+    return { browser, context };
+  }
+
+  private sameSiteToInt(sameSite) {
+    switch (sameSite?.toLowerCase()) {
+      case 'strict':
+        return 2;
+      case 'lax':
+        return 1;
+      default:
+        return 0;
+    }
+  }
+
+  private importCookiesForPersistentContext() {
+    const cookiesFile = this.configService.get<string>(
+      'X_COOKIES_FILE',
+      './sessions/x-cookies.json',
+    );
+
+    if (!existsSync(cookiesFile)) {
+      throw new Error(`Cookies file not found at ${cookiesFile}`);
+    }
+
+    const sqliteFile = './sessions/browser-data-chromium/cookies.sqlite';
+
+    this.logger.log('Importing cookies from', cookiesFile);
+
+    const db = new Database(sqliteFile);
+    const cookies = JSON.parse(readFileSync(cookiesFile, 'utf-8'));
+    const now = Date.now() * 1000;
+    const oneYear = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365;
+
+    const insert = db.prepare(`
+    INSERT OR REPLACE INTO moz_cookies
+      (originAttributes, name, value, host, path, expiry, lastAccessed, creationTime,
+       isSecure, isHttpOnly, inBrowserElement, sameSite, rawSameSite, schemeMap, isPartitionedAttributeSet)
+    VALUES
+      (@originAttributes, @name, @value, @host, @path, @expiry, @lastAccessed, @creationTime,
+       @isSecure, @isHttpOnly, 0, @sameSite, @rawSameSite, 0, 0)
+  `);
+
+    const insertMany = db.transaction((cookies) => {
+      for (const cookie of cookies) {
+        const sameSite = this.sameSiteToInt(cookie.sameSite);
+        insert.run({
+          originAttributes: '',
+          name: cookie.name,
+          value: cookie.value,
+          host: cookie.domain.startsWith('.')
+            ? cookie.domain
+            : `.${cookie.domain}`,
+          path: cookie.path || '/',
+          expiry:
+            cookie.expires && cookie.expires !== -1
+              ? Math.floor(cookie.expires)
+              : oneYear,
+          lastAccessed: now,
+          creationTime: now,
+          isSecure: cookie.secure ? 1 : 0,
+          isHttpOnly: cookie.httpOnly ? 1 : 0,
+          sameSite,
+          rawSameSite: sameSite,
+        });
+      }
+    });
+
+    insertMany(cookies);
+    this.logger.log(`✅ ${cookies.length} cookies importadas en ${sqliteFile}`);
+    db.close();
+  }
+
   async initBrowser(): Promise<BrowserContext> {
     if (this.context) {
       this.logger.log('Browser context already initialized');
@@ -59,7 +179,7 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     }
 
     this.logger.log(
-      `Initializing Crawlee persistent context with ${this.browserEngine} engine...`,
+      `Initializing persistent context with ${this.browserEngine} engine...`,
     );
 
     const headless = this.configService.get<boolean>(
@@ -67,28 +187,91 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
       false,
     );
     const slowMo = this.configService.get<number>('PLAYWRIGHT_SLOW_MO', 100);
+    const useCamoufox = this.configService.get<boolean>('USE_CAMOUFOX', false);
+    const useExtra = this.configService.get<boolean>('USE_EXTRA', false);
 
     try {
       await fs.mkdir(this.userDataDir, { recursive: true });
-      const useCamoufox = this.configService.get<boolean>('USE_CAMOUFOX', false);
 
-      // Build the launch context configuration
-      if (this.browserEngine === 'firefox' || useCamoufox) {
-        this._launchContext = this.buildFirefoxLaunchContext(headless, slowMo);
+      if (useExtra) {
+        // playwright-extra: chromium with puppeteer-extra-plugin-stealth
+        // Dynamic import to avoid loading the module when USE_EXTRA=false
+        this.logger.log(
+          'Initializing playwright-extra chromium with stealth plugin...',
+        );
+        const { chromium: chromiumExtra } = await import('playwright-extra');
+        const { default: StealthPlugin } =
+          await import('puppeteer-extra-plugin-stealth');
+        chromiumExtra.use(StealthPlugin());
+
+        await this.importCookiesForPersistentContext();
+
+        this.context = await chromiumExtra.launchPersistentContext(
+          this.userDataDir,
+          {
+            headless,
+            slowMo,
+            locale: 'es-AR',
+            timezoneId: 'America/Argentina/Cordoba',
+            viewport: { width: 1280, height: 800 },
+          },
+        );
+
+        this.logger.log(
+          'Persistent context launched with playwright-extra + stealth',
+        );
+      } else if (useCamoufox) {
+        const authOnlyWithExportedCookies = this.configService.get<boolean>(
+          'AUTH_ONLY_WITH_EXPORTED_COOKIES',
+          false,
+        );
+
+        if (authOnlyWithExportedCookies) {
+          this.logger.log('Use x cookies to authenticate');
+          const { context } =
+            await this.createCamoufoxBrowserContextWithCookies(headless);
+          this.context = context;
+        } else {
+          await this.importCookiesForPersistentContext();
+          this.logger.log('Persistent context launched with camoufox');
+          this.context = await firefox.launchPersistentContext(
+            this.userDataDir,
+            await camoufoxLaunchOptions({
+              headless,
+              humanizeInput: true,
+              slowMo,
+              locale: 'es-AR',
+              timezoneId: 'America/Argentina/Cordoba',
+              viewport: { width: 1280, height: 800 },
+            }),
+          );
+        }
       } else {
-        this._launchContext = this.buildChromiumLaunchContext(headless, slowMo);
+        // Standard Playwright persistent context
+        if (this.browserEngine === 'firefox') {
+          this._launchContext = this.buildFirefoxLaunchContext(
+            headless,
+            slowMo,
+          );
+        } else {
+          this._launchContext = this.buildChromiumLaunchContext(
+            headless,
+            slowMo,
+          );
+        }
+
+        await this.importCookiesForPersistentContext();
+
+        const launcher = this._launchContext.launcher ?? firefox;
+        this.context = await launcher.launchPersistentContext(
+          this._launchContext.userDataDir ?? this.userDataDir,
+          this._launchContext.launchOptions ?? {},
+        );
+
+        this.logger.log(
+          `Persistent context launched with ${this.browserEngine}`,
+        );
       }
-
-      // Launch the persistent context using the configuration
-      const launcher = this._launchContext.launcher ?? firefox;
-      this.context = await launcher.launchPersistentContext(
-        this._launchContext.userDataDir ?? this.userDataDir,
-        this._launchContext.launchOptions ?? {},
-      );
-
-      this.logger.log(
-        `Persistent context launched with ${this.browserEngine} via Crawlee`,
-      );
 
       // Reuse existing page or create a new one
       if (this.context.pages().length > 0) {
@@ -103,13 +286,6 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
         30000,
       );
       this.page.setDefaultTimeout(timeout);
-
-      // Check if we are already logged in from persistence
-      const isActive = await this.isSessionActive();
-      if (isActive) {
-        this.logger.log('Restored active session from persistent storage');
-      }
-
       this.logger.log('Browser initialized successfully');
       return this.context;
     } catch (error) {
@@ -126,7 +302,9 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     headless: boolean,
     slowMo: number,
   ): PlaywrightLaunchContext {
-    this.logger.log('Building Firefox launch context with anti-detection preferences...');
+    this.logger.log(
+      'Building Firefox launch context with anti-detection preferences...',
+    );
 
     return {
       launcher: firefox,
@@ -141,8 +319,8 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
         javaScriptEnabled: true,
         timezoneId: 'America/Argentina/Cordoba',
         geolocation: {
-          longitude: -64.19535988184161,
-          latitude: -31.406441867821716,
+          longitude: -64.52970321764124,
+          latitude: -30.8677727609467,
         },
         permissions: ['geolocation'],
         acceptDownloads: true,
@@ -192,7 +370,9 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     headless: boolean,
     slowMo: number,
   ): PlaywrightLaunchContext {
-    this.logger.log('Building Chromium launch context with anti-detection args...');
+    this.logger.log(
+      'Building Chromium launch context with anti-detection args...',
+    );
 
     const args = [
       '--disable-blink-features=AutomationControlled',
@@ -226,115 +406,14 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
         javaScriptEnabled: true,
         timezoneId: 'America/Argentina/Cordoba',
         geolocation: {
-          longitude: -64.19535988184161,
-          latitude: -31.406441867821716,
+          longitude: -64.52970321764124,
+          latitude: -30.8677727609467,
         },
         permissions: ['geolocation'],
         acceptDownloads: true,
         channel: 'chrome',
       },
     };
-  }
-
-  /**
-   * Create a one-shot PlaywrightCrawler to run a single navigation task
-   * using Crawlee's request queue model. Useful for isolated scraping jobs
-   * that benefit from Crawlee's retry/session management.
-   *
-   * Anti-blocking features (all configurable via env or per-call options):
-   *  - Browser fingerprints (USE_FINGERPRINTS / useFingerprints)
-   *  - Camoufox stealth build  (USE_CAMOUFOX  / useCamoufox)
-   *  - Proxy rotation           (PROXY_URL    / proxyUrl)
-   */
-  async createCrawler(
-    requestHandler: (context: {
-      page: Page;
-      request: { url: string };
-      handleCloudflareChallenge?: () => Promise<void>;
-    }) => Promise<void>,
-    options: CrawlerOptions = {},
-  ): Promise<PlaywrightCrawler> {
-    // --- resolve options from env with per-call overrides ---
-    const useFingerprints =
-      options.useFingerprints ??
-      this.configService.get<boolean>('USE_FINGERPRINTS', true);
-    const useCamoufox =
-      options.useCamoufox ??
-      this.configService.get<boolean>('USE_CAMOUFOX', false);
-    const proxyUrl =
-      options.proxyUrl ||
-      this.configService.get<string>('PROXY_URL', '') ||
-      undefined;
-
-    // Camoufox has its own fingerprint engine — disable Crawlee's to avoid conflicts
-    const effectiveUseFingerprints = useCamoufox ? false : useFingerprints;
-
-    const headless =
-      options.headless ??
-      this.configService.get<boolean>('PLAYWRIGHT_HEADLESS', false);
-    const slowMo =
-      options.slowMo ??
-      this.configService.get<number>('PLAYWRIGHT_SLOW_MO', 100);
-
-    this.logger.log(
-      `Creating crawler — fingerprints: ${effectiveUseFingerprints}, camoufox: ${useCamoufox}, proxy: ${proxyUrl ?? 'none'}`,
-    );
-
-    // --- build launch context, reusing the same builder methods ---
-    let launchContext: PlaywrightLaunchContext;
-
-    if (useCamoufox) {
-      const camoufoxOpts = await camoufoxLaunchOptions({ headless });
-      launchContext = {
-        launcher: firefox,
-        launchOptions: camoufoxOpts,
-        ...(proxyUrl && { proxyUrl }),
-      };
-    } else {
-      // Reuse the stored launch context if available, otherwise build a fresh one.
-      // Strip userDataDir and useChrome — Crawlee's BrowserPool manages its own
-      // browser instances and would conflict with the persistent context already
-      // opened by initBrowser() if we passed the same userDataDir.
-      const { userDataDir: _stripUDD, useChrome: _stripUC, ...baseLaunchContext } =
-        this._launchContext ??
-        (this.browserEngine === 'firefox'
-          ? this.buildFirefoxLaunchContext(headless, slowMo)
-          : this.buildChromiumLaunchContext(headless, slowMo));
-
-      launchContext = {
-        ...baseLaunchContext,
-        ...(proxyUrl && { proxyUrl }),
-      };
-    }
-
-    // --- assemble crawler config ---
-    const crawlerConfig: ConstructorParameters<typeof PlaywrightCrawler>[0] = {
-      requestHandler: requestHandler as any,
-      launchContext,
-      browserPoolOptions: {
-        useFingerprints: effectiveUseFingerprints,
-        ...(effectiveUseFingerprints &&
-          options.fingerprintOptions && {
-            fingerprintOptions: options.fingerprintOptions,
-          }),
-      },
-      // When using Camoufox, automatically handle Cloudflare challenges
-      ...(useCamoufox && {
-        postNavigationHooks: [
-          async ({ handleCloudflareChallenge }: any) => {
-            if (typeof handleCloudflareChallenge === 'function') {
-              await handleCloudflareChallenge();
-            }
-          },
-        ],
-      }),
-      // Disable Crawlee's built-in storage to avoid conflicts with NestJS
-      maxConcurrency: 1,
-      maxRequestsPerCrawl: 10,
-      persistCookiesPerSession: true,
-    };
-
-    return new PlaywrightCrawler(crawlerConfig);
   }
 
   async closeBrowser(): Promise<void> {
@@ -358,59 +437,22 @@ export class PlaywrightBrowserService implements OnModuleDestroy {
     return this.page;
   }
 
-  /**
-   * Returns the stored PlaywrightLaunchContext built during initBrowser().
-   * Null if the browser has not been initialized yet.
-   */
-  getLaunchContext(): PlaywrightLaunchContext | null {
-    return this._launchContext;
-  }
-
-  async isSessionActive(): Promise<boolean> {
-    if (!this.page) {
-      return false;
-    }
-
-    try {
-      this.logger.debug('Checking session status...');
-      const url = this.page.url();
-      if (
-        url.includes('x.com/home') || 
-        url.includes('twitter.com/home') || 
-        url.includes('x.com/explore') || 
-        url.includes('twitter.com/explore') || 
-        url.includes('x.com/search') || 
-        url.includes('twitter.com/search')
-      ) {
-        this.isAuthenticated = true;
-        return true;
-      }
-
-      const cookies = await this.context?.cookies('https://x.com');
-      const authCookie = cookies?.find((c) => c.name === 'auth_token');
-
-      if (authCookie) {
-        this.logger.debug('Found auth_token cookie, assuming authenticated');
-        this.isAuthenticated = true;
-        return true;
-      }
-
-      return false;
-    } catch (error) {
-      this.logger.error('Error checking session status', error);
-      return false;
-    }
-  }
-
   async takeScreenshot(name: string): Promise<string> {
+    this.logger.log(`Attempting to take screenshot: ${name}`);
     if (!this.page) {
+      this.logger.error('Browser not initialized for screenshot');
       throw new Error('Browser not initialized');
     }
-    const screenshotPath = `./screenshots/${name}-${Date.now()}.png`;
-    await fs.mkdir('./screenshots', { recursive: true });
-    await this.page.screenshot({ path: screenshotPath, fullPage: true });
-    this.logger.log(`Screenshot saved: ${screenshotPath}`);
-    return screenshotPath;
+    try {
+      const screenshotPath = `./screenshots/${name}-${Date.now()}.png`;
+      await fs.mkdir('./screenshots', { recursive: true });
+      await this.page.screenshot({ path: screenshotPath, fullPage: true });
+      this.logger.log(`Screenshot saved: ${screenshotPath}`);
+      return screenshotPath;
+    } catch (error) {
+      this.logger.error(`Failed to take screenshot ${name}`, error);
+      throw error;
+    }
   }
 
   setAuthenticated(value: boolean): void {

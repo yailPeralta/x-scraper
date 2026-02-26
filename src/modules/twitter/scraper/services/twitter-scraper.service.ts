@@ -1,31 +1,34 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PlaywrightBrowserService } from './playwright-browser.service';
 import { TweetRepository } from '../repositories/tweet.repository';
 import { XUserRepository } from '../repositories/x-user.repository';
 import { TWITTER_SELECTORS } from '../constants/twitter-selectors.constants';
 import { ElementHandle, Page } from 'playwright';
-import { PlaywrightCrawler } from 'crawlee';
+import { ScrapingThrottle } from '../utils/scraping-throttle.util';
+import { BROWSER_ENGINE_SERVICE } from '../interfaces/browser-engine.interface';
+import type { IBrowserEngineService } from '../interfaces/browser-engine.interface';
+import { URLS } from '../constants/twitter-urls.constants';
 
 @Injectable()
 export class TwitterScraperService implements OnModuleInit {
   private readonly logger = new Logger(TwitterScraperService.name);
-  private playwrightCrawler: PlaywrightCrawler;
 
   constructor(
-    private browserService: PlaywrightBrowserService,
+    @Inject(BROWSER_ENGINE_SERVICE)
+    private engineService: IBrowserEngineService,
     private tweetRepository: TweetRepository,
     private xUserRepository: XUserRepository,
     private configService: ConfigService,
   ) {}
 
   async onModuleInit() {
-    await this.browserService.initBrowser();
+    // Delegate browser initialisation to the engine.
+    // PlaywrightEngineService launches the persistent context;
+    // CrawleeEngineService is a no-op (Crawlee manages its own browser pool).
+    await this.engineService.init();
   }
 
   async login(username?: string, password?: string): Promise<boolean> {
-    const page = this.browserService.getPage();
-
     const twitterUsername =
       username || this.configService.get<string>('TWITTER_USERNAME');
     const twitterPassword =
@@ -38,98 +41,42 @@ export class TwitterScraperService implements OnModuleInit {
     try {
       this.logger.log('Starting Twitter login process...');
 
-      await page.goto('https://x.com/i/flow/login');
+      // Use navigate() so both PlaywrightEngineService and CrawleeEngineService
+      // can perform the login — each engine handles navigation in its own way.
+      await this.engineService.navigate(URLS.LOGIN, async (page) => {
+        const usernameLocator = page.locator(
+          TWITTER_SELECTORS.LOGIN.USERNAME_INPUT,
+        );
+        await usernameLocator.waitFor();
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await usernameLocator.fill(twitterUsername);
+        await page.click(TWITTER_SELECTORS.LOGIN.NEXT_BUTTON);
 
-      const usernameLocator = page.locator(
-        TWITTER_SELECTORS.LOGIN.USERNAME_INPUT,
-      );
-      await usernameLocator.waitFor();
-      usernameLocator.fill(twitterUsername);
-      page.click(TWITTER_SELECTORS.LOGIN.NEXT_BUTTON);
+        const passwordLocator = page.locator(
+          TWITTER_SELECTORS.LOGIN.PASSWORD_INPUT,
+        );
+        await passwordLocator.waitFor();
 
-      const passwordLocator = page.locator(
-        TWITTER_SELECTORS.LOGIN.PASSWORD_INPUT,
-      );
-      await passwordLocator.waitFor();
-      passwordLocator.fill(twitterPassword);
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await passwordLocator.fill(twitterPassword);
 
-      await page.click(TWITTER_SELECTORS.LOGIN.LOGIN_BUTTON);
-      await page.waitForURL('**/home', { timeout: 15000 });
+        await page.click(TWITTER_SELECTORS.LOGIN.LOGIN_BUTTON);
+        await page.waitForURL('**/home', { timeout: 30000 });
+      });
 
       this.logger.log('Login successful');
-      this.browserService.setAuthenticated(true);
+
       return true;
     } catch (error) {
       this.logger.error('Login failed', error);
-      await this.browserService.takeScreenshot('login-error');
+      await this.engineService.takeScreenshot('login-error');
       throw new Error(`Login failed: ${error.message}`);
-    }
-  }
-
-  async ensureAuthenticated(): Promise<void> {
-    if (!this.browserService.getIsAuthenticated()) {
-      const isActive = await this.browserService.isSessionActive();
-      if (!isActive) {
-        await this.login();
-      }
     }
   }
 
   // ---------------------------------------------------------------------------
   // Core scraping helpers
   // ---------------------------------------------------------------------------
-
-  /**
-   * Navigate to `url` using the existing persistent browser context and run
-   * the `collector` callback. This reuses the authenticated session (cookies,
-   * storage) without launching a second browser instance.
-   *
-   * Use this for authenticated scraping tasks (search, tweet-by-id, etc.).
-   */
-  private async runWithPage<T>(
-    url: string,
-    collector: (page: Page) => Promise<T>,
-  ): Promise<T> {
-    const page = this.browserService.getPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
-    return collector(page);
-  }
-
-  /**
-   * Scroll-and-collect loop using Crawlee's PlaywrightCrawler.
-   *
-   * The crawler navigates to `url`, then runs the `collector` callback which
-   * performs the scroll loop and returns the collected items. The result is
-   * surfaced back to the caller via a shared `result` variable.
-   *
-   * NOTE: Crawlee launches its own browser instance (without userDataDir) so
-   * this method does NOT share cookies/session with the persistent context.
-   * Use `runWithPage()` for authenticated tasks instead.
-   */
-  private async runCrawlee<T>(
-    url: string,
-    collector: (page: Page) => Promise<T>,
-  ): Promise<T> {
-    let result: T;
-    let crawlError: Error | undefined;
-
-    if (!this.playwrightCrawler) {
-      this.playwrightCrawler = await this.browserService.createCrawler(
-        async ({ page }) => {
-          try {
-            result = await collector(page);
-          } catch (err) {
-            crawlError = err;
-          }
-        },
-      );
-    }
-
-    await this.playwrightCrawler.run([url]);
-
-    if (crawlError) throw crawlError;
-    return result!;
-  }
 
   private async paginateAndExtractTweets(
     page: Page,
@@ -149,11 +96,26 @@ export class TwitterScraperService implements OnModuleInit {
       2000,
     );
 
+    // Throttle to insert human-like pauses and avoid account blocks.
+    // Pauses kick in after the first 10 collected tweets.
+    const throttle = new ScrapingThrottle({ burstThreshold: 10 });
+
     await page.waitForSelector(TWITTER_SELECTORS.TWEET.ARTICLE);
+
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     while (collected.length < limit && scrollAttempts < maxScrollAttempts) {
       const countBefore = collected.length;
       const tweetElements = await page.$$(TWITTER_SELECTORS.TWEET.ARTICLE);
+
+      // Detect potential rate-limit signal: no elements found after the first scroll
+      if (tweetElements.length === 0 && scrollAttempts > 0) {
+        this.logger.warn(
+          `No tweet elements found on scroll #${scrollAttempts}. Applying backoff...`,
+        );
+        const waited = await throttle.backoff();
+        this.logger.log(`Backoff applied: ${waited}ms`);
+      }
 
       for (const element of tweetElements) {
         if (collected.length >= limit) break;
@@ -172,6 +134,8 @@ export class TwitterScraperService implements OnModuleInit {
           if (tweetData.tweetId && !seenIds.has(tweetData.tweetId)) {
             seenIds.add(tweetData.tweetId);
             collected.push(tweetData);
+
+            await throttle.tick(collected.length);
           }
         } catch (err) {
           this.logger.warn('Failed to extract tweet data', err);
@@ -193,6 +157,9 @@ export class TwitterScraperService implements OnModuleInit {
       await page.waitForTimeout(scrollDelay);
       scrollAttempts++;
     }
+
+    // Reset backoff so the next call starts fresh
+    throttle.resetBackoff();
 
     return collected;
   }
@@ -222,20 +189,23 @@ export class TwitterScraperService implements OnModuleInit {
     this.logger.log(`Scraping tweets from @${username}, limit: ${limit}`);
 
     try {
-      const tweets = await this.runCrawlee(profileUrl, async (page) => {
-        return await this.paginateAndExtractTweets(
-          page,
-          limit,
-          includeRetweets,
-          includeQuoted,
-        );
-      });
+      const tweets = await this.engineService.navigate(
+        profileUrl,
+        async (page) => {
+          return await this.paginateAndExtractTweets(
+            page,
+            limit,
+            includeRetweets,
+            includeQuoted,
+          );
+        },
+      );
 
       this.logger.log(`Scraped ${tweets.length} tweets from @${username}`);
       return tweets;
     } catch (error) {
       this.logger.error(`Error scraping tweets from @${username}`, error);
-      await this.browserService.takeScreenshot(`error-${username}`);
+      await this.engineService.takeScreenshot(`error-${username}`);
       throw error;
     }
   }
@@ -247,7 +217,11 @@ export class TwitterScraperService implements OnModuleInit {
       filters?: any;
     } = {},
   ): Promise<any[]> {
-    await this.ensureAuthenticated();
+    const isAuthenticated = await this.engineService.isAuthenticated();
+
+    if (!isAuthenticated) {
+      throw new Error('Twitter session is not authenticated');
+    }
 
     const limit = options.limit || 50;
     const filters = options.filters || {};
@@ -258,79 +232,115 @@ export class TwitterScraperService implements OnModuleInit {
     this.logger.log(`Searching tweets for: "${query}", limit: ${limit}`);
 
     try {
-      const tweets = await this.runWithPage(searchUrl, async (page) => {
-        await page.locator(TWITTER_SELECTORS.TWEET.ARTICLE).first().waitFor();
+      const tweets = await this.engineService.navigate(
+        searchUrl,
+        async (page) => {
+          await page.locator(TWITTER_SELECTORS.TWEET.ARTICLE).first().waitFor();
 
-        const collected: any[] = [];
-        // O(1) deduplication via Set of tweet IDs
-        const seenIds = new Set<string>();
-        let scrollAttempts = 0;
-        const maxScrollAttempts = 50;
-        let consecutiveEmpty = 0;
-        const MAX_CONSECUTIVE_EMPTY = 5;
-        const scrollDelay = this.configService.get<number>(
-          'SCRAPING_SCROLL_DELAY',
-          2000,
-        );
+          await new Promise((resolve) => setTimeout(resolve, 5000));
 
-        while (collected.length < limit && scrollAttempts < maxScrollAttempts) {
-          const countBefore = collected.length;
-          const tweetElements = await page.$$(TWITTER_SELECTORS.TWEET.ARTICLE);
-
-          this.logger.debug(
-            `Scroll #${scrollAttempts}: ${tweetElements.length} tweet elements found (collected so far: ${collected.length})`,
+          const collected: any[] = [];
+          // O(1) deduplication via Set of tweet IDs
+          const seenIds = new Set<string>();
+          let scrollAttempts = 0;
+          const maxScrollAttempts = 50;
+          let consecutiveEmpty = 0;
+          const MAX_CONSECUTIVE_EMPTY = 5;
+          const scrollDelay = this.configService.get<number>(
+            'SCRAPING_SCROLL_DELAY',
+            2000,
           );
 
-          for (const element of tweetElements) {
-            if (collected.length >= limit) break;
-            try {
-              const rawTweetData = await this.extractTweetData(page, element);
-              const tweetData = await this.processTweetWithAuthor(rawTweetData);
+          // Burst = 20% del límite, mínimo 5, máximo 20
+          const burstThreshold = Math.min(
+            Math.max(Math.floor(limit * 0.2), 5),
+            20,
+          );
+          const throttle = new ScrapingThrottle({ burstThreshold });
 
-              // O(1) duplicate check via Set instead of O(n) Array.find()
-              if (tweetData.tweetId && !seenIds.has(tweetData.tweetId)) {
-                seenIds.add(tweetData.tweetId);
-                collected.push(tweetData);
-              }
-            } catch (err) {
-              this.logger.warn('Failed to extract tweet data', err);
-            }
-          }
-
-          // Declare feed exhausted only after MAX_CONSECUTIVE_EMPTY scrolls with
-          // no new unique tweets — tolerates X.com virtual DOM viewport overlap.
-          if (collected.length === countBefore) {
-            consecutiveEmpty++;
-            this.logger.debug(
-              `Scroll #${scrollAttempts}: no new tweets (${consecutiveEmpty}/${MAX_CONSECUTIVE_EMPTY} consecutive empty scrolls)`,
+          while (
+            collected.length < limit &&
+            scrollAttempts < maxScrollAttempts
+          ) {
+            const countBefore = collected.length;
+            const tweetElements = await page.$$(
+              TWITTER_SELECTORS.TWEET.ARTICLE,
             );
-            if (consecutiveEmpty >= MAX_CONSECUTIVE_EMPTY) {
-              this.logger.log(
-                `Feed exhausted after ${scrollAttempts} scrolls. Collected ${collected.length}/${limit} tweets.`,
+
+            this.logger.debug(
+              `Scroll #${scrollAttempts}: ${tweetElements.length} tweet elements found (collected so far: ${collected.length})`,
+            );
+
+            // Detect potential rate-limit signal: no elements found after the first scroll
+            if (tweetElements.length === 0 && scrollAttempts > 0) {
+              this.logger.warn(
+                `No tweet elements found on scroll #${scrollAttempts}. Applying backoff...`,
               );
-              break;
+              const waited = await throttle.backoff();
+              this.logger.log(`Backoff applied: ${waited}ms`);
             }
-          } else {
-            consecutiveEmpty = 0;
+
+            for (const element of tweetElements) {
+              if (collected.length >= limit) break;
+              try {
+                const rawTweetData = await this.extractTweetData(page, element);
+                const tweetData =
+                  await this.processTweetWithAuthor(rawTweetData);
+
+                // O(1) duplicate check via Set instead of O(n) Array.find()
+                if (tweetData.tweetId && !seenIds.has(tweetData.tweetId)) {
+                  seenIds.add(tweetData.tweetId);
+                  collected.push(tweetData);
+
+                  await throttle.tick(collected.length);
+                }
+              } catch (err) {
+                this.logger.warn('Failed to extract tweet data', err);
+              }
+            }
+
+            // Declare feed exhausted only after MAX_CONSECUTIVE_EMPTY scrolls with
+            // no new unique tweets — tolerates X.com virtual DOM viewport overlap.
+            if (collected.length === countBefore) {
+              consecutiveEmpty++;
+              this.logger.debug(
+                `Scroll #${scrollAttempts}: no new tweets (${consecutiveEmpty}/${MAX_CONSECUTIVE_EMPTY} consecutive empty scrolls)`,
+              );
+              if (consecutiveEmpty >= MAX_CONSECUTIVE_EMPTY) {
+                this.logger.log(
+                  `Feed exhausted after ${scrollAttempts} scrolls. Collected ${collected.length}/${limit} tweets.`,
+                );
+                break;
+              }
+            } else {
+              consecutiveEmpty = 0;
+            }
+
+            // Scroll to the bottom of the currently rendered content so X.com's
+            // virtual scroller triggers loading the next batch of tweets.
+            await page.evaluate(() =>
+              window.scrollTo(0, document.body.scrollHeight),
+            );
+            await page.waitForTimeout(scrollDelay);
+            scrollAttempts++;
           }
 
-          // Scroll to the bottom of the currently rendered content so X.com's
-          // virtual scroller triggers loading the next batch of tweets.
-          await page.evaluate(() =>
-            window.scrollTo(0, document.body.scrollHeight),
-          );
-          await page.waitForTimeout(scrollDelay);
-          scrollAttempts++;
-        }
+          // Reset backoff so the next call starts fresh
+          throttle.resetBackoff();
 
-        return collected;
-      });
+          return collected;
+        },
+      );
+
+      if (!tweets?.length) {
+        throw new Error(`No tweets found for search: "${query}"`);
+      }
 
       this.logger.log(`Found ${tweets.length} tweets for search: "${query}"`);
       return tweets;
     } catch (error) {
       this.logger.error(`Error searching tweets for: "${query}"`, error);
-      await this.browserService.takeScreenshot(`error-search-${searchTerm}`);
+      await this.engineService.takeScreenshot(`error-search-${searchTerm}`);
       throw error;
     }
   }
@@ -343,35 +353,49 @@ export class TwitterScraperService implements OnModuleInit {
         return cachedTweet;
       }
 
-      await this.ensureAuthenticated();
+      const isAuthenticated = await this.engineService.isAuthenticated();
+
+      if (!isAuthenticated) {
+        throw new Error('Twitter session is not authenticated');
+      }
 
       this.logger.log(`Scraping tweet ${tweetId} from Twitter`);
       const tweetUrl = `https://x.com/i/status/${tweetId}`;
 
-      const tweetData = await this.runWithPage(tweetUrl, async (page) => {
-        await page.locator(TWITTER_SELECTORS.TWEET.ARTICLE).first().waitFor();
+      const tweetData = await this.engineService.navigate(
+        tweetUrl,
+        async (page) => {
+          await page.locator(TWITTER_SELECTORS.TWEET.ARTICLE).first().waitFor();
 
-        const tweetElement = await page.$(TWITTER_SELECTORS.TWEET.ARTICLE);
-        if (!tweetElement) throw new Error('Tweet not found');
+          const tweetElement = await page.$(TWITTER_SELECTORS.TWEET.ARTICLE);
+          if (!tweetElement) throw new Error('Tweet not found');
 
-        const rawTweetData = await this.extractTweetData(page, tweetElement);
-        return this.processTweetWithAuthor(rawTweetData);
-      });
+          const rawTweetData = await this.extractTweetData(page, tweetElement);
+          return this.processTweetWithAuthor(rawTweetData);
+        },
+      );
 
       await this.tweetRepository.create(tweetData);
       return tweetData;
     } catch (error) {
       this.logger.error(`Error getting tweet ${tweetId}`, error);
+      await this.engineService.takeScreenshot(`error-tweet-${tweetId}`);
       throw error;
     }
   }
 
   async getUserProfile(username: string): Promise<any> {
     this.logger.log(`Getting profile for @${username}`);
-    await this.ensureAuthenticated();
+    const isAuthenticated = await this.engineService.isAuthenticated();
+
+    if (!isAuthenticated) {
+      throw new Error('Twitter session is not authenticated');
+    }
 
     try {
-      const page = this.browserService.getPage();
+      // getUserProfile requires response interception which needs the persistent
+      // context page directly — use engineService.getPage() for direct access.
+      const page = this.engineService.getPage();
 
       // Set up response interception BEFORE navigation to capture the
       // internal GraphQL call to UserByScreenName which contains rest_id.

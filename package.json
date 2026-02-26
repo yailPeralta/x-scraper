@@ -32,6 +32,7 @@
     "@nestjs/platform-express": "^11.0.1",
     "@nestjs/schedule": "^6.1.1",
     "@xdevplatform/xdk": "^0.4.0",
+    "better-sqlite3": "^12.6.2",
     "camoufox-js": "^0.1.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
@@ -39,6 +40,8 @@
     "dotenv": "^17.2.4",
     "joi": "^18.0.2",
     "mongoose": "^9.2.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },

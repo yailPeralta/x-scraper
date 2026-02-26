@@ -19,6 +19,15 @@ export interface EnvironmentVariables {
   PLAYWRIGHT_TIMEOUT: number;
   PLAYWRIGHT_SLOW_MO: number;
 
+  // Scraper engine:
+  //   'crawlee'    → Crawlee's PlaywrightCrawler (fingerprint spoofing, proxy rotation)
+  //   'playwright' → Persistent Playwright context (shared authenticated session)
+  SCRAPER_ENGINE: 'crawlee' | 'playwright';
+
+  // When SCRAPER_ENGINE=crawlee, use playwright-extra with puppeteer-extra-plugin-stealth
+  // as the Crawlee launcher instead of the default Playwright browser.
+  USE_EXTRA: boolean;
+
   // Anti-Blocking
   USE_FINGERPRINTS: boolean;
   USE_CAMOUFOX: boolean;
@@ -48,6 +57,12 @@ export interface EnvironmentVariables {
   TRENDING_TWEETS_CRON: string;
 
   CURRRENT_X_USER_ID: string;
+
+  // Cookies file path for X/Twitter session
+  X_COOKIES_FILE: string;
+
+  // When true, authentication is performed exclusively using exported cookies (skips credential login)
+  AUTH_ONLY_WITH_EXPORTED_COOKIES: boolean;
 }
 
 export const validationSchema = Joi.object({
@@ -73,6 +88,12 @@ export const validationSchema = Joi.object({
   PLAYWRIGHT_HEADLESS: Joi.boolean().default(true),
   PLAYWRIGHT_TIMEOUT: Joi.number().default(30000),
   PLAYWRIGHT_SLOW_MO: Joi.number().default(100),
+
+  // Scraper engine
+  SCRAPER_ENGINE: Joi.string().valid('crawlee', 'playwright').default('crawlee'),
+
+  // When SCRAPER_ENGINE=crawlee, use playwright-extra + stealth as the Crawlee launcher
+  USE_EXTRA: Joi.boolean().default(false),
 
   // Anti-Blocking
   USE_FINGERPRINTS: Joi.boolean().default(true),
@@ -103,4 +124,10 @@ export const validationSchema = Joi.object({
   TRENDING_TWEETS_CRON: Joi.string().required(),
 
   CURRENT_X_USER_ID: Joi.string().required(),
+
+  // Cookies file path for X/Twitter session
+  X_COOKIES_FILE: Joi.string().default('./sessions/x-cookies.json'),
+
+  // When true, authentication is performed exclusively using exported cookies (skips credential login)
+  AUTH_ONLY_WITH_EXPORTED_COOKIES: Joi.boolean().default(false),
 });

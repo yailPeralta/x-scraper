@@ -20,7 +20,8 @@ export const TWITTER_SELECTORS = {
     USER_AVATAR: '[data-testid="Tweet-User-Avatar"]',
     SOCIAL_CONTEXT: '[data-testid="socialContext"]',
     ARIA_LABELLEDBY: 'div[aria-labelledby]',
-    VIDEO_COMPONENT: '[data-testid="videoComponent"]'
+    VIDEO_COMPONENT: '[data-testid="videoComponent"]',
+    STATUS_LINK: 'a[href*="/status/"]'
   },
   PROFILE: {
     USERNAME: '[data-testid="UserName"]',
